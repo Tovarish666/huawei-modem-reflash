@@ -155,6 +155,16 @@ hilink_up() {  # hilink_up <сек на линк>; 0 - веб отвечает, 
   for i in $(seq 30); do curl -s -m 2 -o /dev/null http://$MODEM_IP/api/webserver/SesTokInfo && return 0; sleep 1; done
   return 3
 }
+hilink_now() {  # без ожидания: сеть модема работает прямо сейчас (линк есть и 192.168.8.1 отвечает)?
+  local i ifc=""
+  for i in $(seq 5); do ifc=$(ls /sys/bus/usb/devices/"$(usbdev)":1.0/net/ 2>/dev/null | head -1); [ -n "$ifc" ] && break; sleep 1; done
+  [ -n "$ifc" ] || return 1
+  ip link set "$ifc" up
+  [ "$(cat "/sys/class/net/$ifc/carrier" 2>/dev/null)" = 1 ] || return 1
+  ip addr flush dev "$ifc"
+  ip addr add "$HOST_IP/24" dev "$ifc"
+  curl -s -m 3 -o /dev/null http://$MODEM_IP/api/webserver/SesTokInfo
+}
 hl_err() { case $1 in 1) echo "нет сетевого интерфейса" ;; 2) echo "нет сетевого линка" ;; *) echo "веб-интерфейс не отвечает" ;; esac; }
 api() {  # api <путь> [xml для POST]
   local tok ses tk
@@ -318,16 +328,25 @@ stage_1f01() {
   wait_reenum 30 || fail "модем не переключился из режима накопителя"
 }
 stage_14dc() {
-  local rc i t=20
-  # всерьёз ждём сеть только от свежей прошивки; на сеть старой не полагаемся
-  { [ $STEP -eq 2 ] || [ $PRE -eq 1 ]; } && t=120
-  hilink_up $t; rc=$?
+  local rc i
+  if [ $STEP -eq 0 ] && [ $PRE -eq 0 ]; then
+    # сеть старой прошивки не ждём: либо ADB доступен прямо сейчас, либо переткнуть модем -
+    # тогда он придёт в стартовом режиме и пойдёт через AT-порт, которому сеть не нужна
+    if ! hilink_now || ! adb_ok; then
+      say "${Y}Модем уже в HiLink, а сразу через сеть его не взять. Выньте модем и вставьте снова - дальше через AT-порт${N}"
+      for i in $(seq 600); do [ "$(mode)" != 14dc ] && return; sleep 1; done
+      fail "модем не переподключили за 10 минут"
+    fi
+    check_hw "$(xml HardwareVersion "$(api device/information)")" "веб-API"
+    adb_wipe
+    wait_mode 1443 90 || fail "после затирания загрузчика модем не вошёл в аварийку - нужна игла"
+    return
+  fi
+  # сеть ждём только от свежезаписанной прошивки
+  hilink_up 120; rc=$?
   if [ $rc -ne 0 ]; then
     [ $STEP -eq 2 ] && fail "после прошивки HiLink не работает: $(hl_err $rc)"
-    [ $PRE -eq 1 ] && fail "после предварительной прошивки HiLink не работает ($(hl_err $rc)) - без ADB в аварийку не попасть: вставьте модем с замкнутой бутовой точкой и запустите с --force-1443"
-    say "${Y}Сеть старой прошивки не отвечает ($(hl_err $rc)). Выньте модем и вставьте снова - дальше скрипт пойдёт через AT-порт${N}"
-    for i in $(seq 600); do [ "$(mode)" != 14dc ] && return; sleep 1; done
-    fail "модем не переподключили за 10 минут"
+    fail "после предварительной прошивки HiLink не работает ($(hl_err $rc)) - без ADB в аварийку не попасть: вставьте модем с замкнутой бутовой точкой и запустите с --force-1443"
   fi
   [ $STEP -eq 2 ] && finish
   check_hw "$(xml HardwareVersion "$(api device/information)")" "веб-API"
@@ -336,10 +355,7 @@ stage_14dc() {
     wait_mode 1443 90 || fail "после затирания загрузчика модем не вошёл в аварийку - нужна игла"
     return
   fi
-  [ $PRE -eq 1 ] && fail "в итоговой прошивке нет ADB - без иглы в аварийку не попасть (вставьте модем с иглой и запустите с --force-1443)"
-  say "ADB нет - перезагружаю модем через веб-API, дальше через AT-порт"
-  api device/control '<?xml version="1.0" encoding="UTF-8"?><request><Control>1</Control></request>' >>"$LOG" 2>&1
-  wait_reenum 90 || fail "модем не перезагрузился по API - выньте и вставьте его"
+  fail "в итоговой прошивке нет ADB - без иглы в аварийку не попасть (вставьте модем с иглой и запустите с --force-1443)"
 }
 finish() {
   local info sw web imei
