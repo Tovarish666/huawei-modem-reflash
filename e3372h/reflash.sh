@@ -130,29 +130,38 @@ flash() {  # flash <tty> <файл> [ключи balong_flash]
 xml() { echo "$2" | sed -n "s:.*<$1>\(.*\)</$1>.*:\1:p" | head -1; }
 
 # ---------- HiLink / веб-API / ADB ----------
-hilink_up() {  # hilink_up <сек на линк>; 0 - веб отвечает, 1 - нет интерфейса, 2 - нет линка, 3 - не отвечает веб
+hilink_up() {  # hilink_up <сек>; 0 - веб отвечает, 1 - нет интерфейса, 2 - нет линка, 3 - не отвечает веб, 4 - сменился режим
   local i ifc=""
   for i in $(seq 15); do ifc=$(ls /sys/bus/usb/devices/"$(usbdev)":1.0/net/ 2>/dev/null | head -1); [ -n "$ifc" ] && break; sleep 1; done
   [ -z "$ifc" ] && return 1
-  ip link set "$ifc" up
-  say "  жду сетевой линк от модема (до $1 с)..."
-  for i in $(seq "$1"); do [ "$(cat "/sys/class/net/$ifc/carrier" 2>/dev/null)" = 1 ] && break; sleep 1; done
-  [ "$(cat "/sys/class/net/$ifc/carrier" 2>/dev/null)" = 1 ] || return 2
-  ip addr flush dev "$ifc"
-  ip addr add "$HOST_IP/24" dev "$ifc"
-  say "  линк есть, проверяю веб-интерфейс на $MODEM_IP (до 30 с)..."
-  for i in $(seq 30); do curl -s -m 2 -o /dev/null http://$MODEM_IP/api/webserver/SesTokInfo && return 0; sleep 1; done
-  # адрес веб-интерфейса бывает не 192.168.8.1 - узнаём через DHCP, маршрут по умолчанию не трогаем
-  say "  на $MODEM_IP не отвечает, узнаю адрес модема по DHCP..."
-  local p
-  p=$("$DHCP" "$ifc" 2>/dev/null) || return 3
-  set -- $p
-  MODEM_IP=$1; HOST_IP=$2
-  ip addr flush dev "$ifc"
-  ip addr add "$HOST_IP/24" dev "$ifc"
-  say "  модем на $MODEM_IP, жду веб-интерфейс (до 30 с)..."
-  for i in $(seq 30); do curl -s -m 2 -o /dev/null http://$MODEM_IP/api/webserver/SesTokInfo && return 0; sleep 1; done
-  return 3
+  # при первой загрузке линк "моргает" - ждём не линк, а ответ веб-интерфейса, до $1 секунд
+  local end=$((SECONDS + $1)) up_since=0 dhcp_tried=0 p
+  say "  жду, пока модем ответит по сети (до $1 с)..."
+  while [ $SECONDS -lt $end ]; do
+    [ "$(mode)" = 14dc ] || return 4
+    ip link set "$ifc" up 2>/dev/null
+    ip addr replace "$HOST_IP/24" dev "$ifc" 2>/dev/null
+    if [ "$(cat "/sys/class/net/$ifc/carrier" 2>/dev/null)" = 1 ]; then
+      [ $up_since -eq 0 ] && up_since=$SECONDS
+      curl -s -m 2 -o /dev/null "http://$MODEM_IP/api/webserver/SesTokInfo" && return 0
+      # линк держится 20 с, а 192.168.8.1 молчит - адрес бывает другой, узнаём по DHCP (маршруты не трогаем)
+      if [ $dhcp_tried -eq 0 ] && [ $((SECONDS - up_since)) -ge 20 ]; then
+        dhcp_tried=1
+        say "  на $MODEM_IP не отвечает, узнаю адрес модема по DHCP..."
+        if p=$("$DHCP" "$ifc" 2>/dev/null); then
+          set -- $p
+          MODEM_IP=$1; HOST_IP=$2
+          ip addr flush dev "$ifc"
+          say "  модем на $MODEM_IP"
+        fi
+      fi
+    else
+      up_since=0
+    fi
+    sleep 2
+  done
+  [ "$(cat "/sys/class/net/$ifc/carrier" 2>/dev/null)" = 1 ] && return 3
+  return 2
 }
 hilink_now() {  # без ожидания: сеть модема работает прямо сейчас (линк есть и 192.168.8.1 отвечает)?
   local i ifc=""
@@ -349,6 +358,7 @@ stage_14dc() {
   fi
   # сеть ждём только от свежезаписанной прошивки
   hilink_up 120; rc=$?
+  [ $rc -eq 4 ] && return  # модем сменил режим - разберётся основной цикл
   if [ $rc -ne 0 ]; then
     [ $STEP -eq 2 ] && fail "после прошивки HiLink не работает: $(hl_err $rc)"
     need_needle "временная прошивка не подняла сеть ($(hl_err $rc)) - без ADB загрузчик не стереть"
