@@ -12,10 +12,12 @@
 # Перед любым разрушающим шагом скрипт проверяет, что это E3372h-153 (плата CL2E3372HM):
 # по веб-API, по AT^VERSION? или по AT^DLOADINFO? в режиме обновления. E3372s и другие - отказ.
 #
-# Модем можно вставить до или после запуска. Аварийка (1443) получается:
-#   - сама, если загрузчик уже повреждён, или игла;
-#   - без иглы, если в прошивке есть ADB (например, у прошивки dinis.ru): скрипт затирает загрузчик через ADB.
-# Если ADB нет, прошивка идёт через режим обновления (AT^GODLOAD) - без балона и GO.
+# Модем лучше вставлять после запуска: тогда он приходит в стартовом режиме (1f01), и скрипт
+# ведёт его через AT-порт, не завися от сети старой (возможно, убитой) прошивки:
+#   AT-порт -> AT^GODLOAD -> предварительная прошивка итоговой (в ней есть ADB) -> через ADB
+#   затирается загрузчик -> аварийка (1443) -> балон -> GO -> балон -> переходная -> итоговая.
+# Если модем уже в HiLink и его сеть отвечает, ADB используется сразу, без предварительной прошивки.
+# Если загрузчик уже повреждён, модем приходит в аварийку сам; иглой - с ключом --force-1443.
 # В конце сверяет версию и IMEI через веб-API и пишет ГОТОВО или ОШИБКА.
 set -u
 
@@ -129,13 +131,13 @@ flash() {  # flash <tty> <файл> [ключи balong_flash]
 xml() { echo "$2" | sed -n "s:.*<$1>\(.*\)</$1>.*:\1:p" | head -1; }
 
 # ---------- HiLink / веб-API / ADB ----------
-hilink_up() {  # 0 - веб-интерфейс отвечает, 1 - нет интерфейса, 2 - нет линка, 3 - не отвечает веб
+hilink_up() {  # hilink_up <сек на линк>; 0 - веб отвечает, 1 - нет интерфейса, 2 - нет линка, 3 - не отвечает веб
   local i ifc=""
   for i in $(seq 15); do ifc=$(ls /sys/bus/usb/devices/"$(usbdev)":1.0/net/ 2>/dev/null | head -1); [ -n "$ifc" ] && break; sleep 1; done
   [ -z "$ifc" ] && return 1
   ip link set "$ifc" up
-  say "  жду сетевой линк от модема (до 60 с)..."
-  for i in $(seq 60); do [ "$(cat "/sys/class/net/$ifc/carrier" 2>/dev/null)" = 1 ] && break; sleep 1; done
+  say "  жду сетевой линк от модема (до $1 с)..."
+  for i in $(seq "$1"); do [ "$(cat "/sys/class/net/$ifc/carrier" 2>/dev/null)" = 1 ] && break; sleep 1; done
   [ "$(cat "/sys/class/net/$ifc/carrier" 2>/dev/null)" = 1 ] || return 2
   # адрес веб-интерфейса бывает не 192.168.8.1 - узнаём через DHCP, маршрут по умолчанию не трогаем
   local p
@@ -165,24 +167,6 @@ adb_ok() {
   adb_reset
   timeout 15 adb connect $MODEM_IP:5555 2>&1 | grep -q "^connected" || return 1
   [ "$(timeout 10 adb -s $MODEM_IP:5555 shell echo ok 2>/dev/null | tr -d '\r')" = ok ]
-}
-nv_backup() {  # резервная копия загрузчика и NV (IMEI, калибровка) через ADB перед затиранием
-  local A="timeout 120 adb -s $MODEM_IP:5555" imei dst nm n
-  imei=$(xml Imei "$(api device/information)")
-  dst=$ROOT/backups/${imei:-unknown}-$(date +%Y%m%d-%H%M%S)
-  mkdir -p "$dst"
-  say "Резервная копия загрузчика и NV -> $dst"
-  # nvimg (рабочая копия NV) не читаем: на части прошивок чтение зависает и роняет ADB,
-  # а модем всё равно восстанавливает её из nvbacklte
-  for nm in m3boot fastboot nvbacklte nvdefault nvdload oeminfo; do
-    n=$($A shell "busybox grep '\"$nm\"' /proc/mtd" 2>/dev/null | tr -d '\r' | sed -n 's/^mtd\([0-9]*\):.*/\1/p')
-    [ -z "$n" ] && { say "  ${Y}раздела $nm нет в /proc/mtd${N}"; continue; }
-    $A pull "/dev/block/mtdblock$n" "$dst/mtd$n-$nm.bin" >>"$LOG" 2>&1 || { rm -f "$dst/mtd$n-$nm.bin"; say "  ${Y}не удалось сохранить $nm${N}"; }
-  done
-  (cd "$dst" && sha256sum ./*.bin > SHA256SUMS 2>/dev/null)
-  for nm in nvbacklte oeminfo; do
-    ls "$dst"/mtd*-"$nm".bin >/dev/null 2>&1 || fail "не сохранился раздел $nm - затирать загрузчик без резервной копии не буду"
-  done
 }
 adb_wipe() {
   local A="timeout 60 adb -s $MODEM_IP:5555 shell" e0 e1 g0 g1
@@ -283,6 +267,16 @@ stage_ports() {  # 1442 / отладочный режим: модем отдал
     NDLOAD=$((NDLOAD + 1))
     [ $NDLOAD -gt 3 ] && fail "модем снова и снова возвращается в режим обновления"
     say "Режим обновления загрузчика"
+    if [ $STEP -eq 0 ] && [ $PRE -eq 0 ] && [ $BALON -eq 0 ]; then
+      # до зачистки: сначала ставим итоговую прошивку - в ней точно есть ADB, через него потом
+      # затрём загрузчик и пройдём балон и GO. От сети старой прошивки ничего не зависит.
+      say "Предварительная прошивка (ради ADB): $(basename "$FINAL")"
+      flash "$tty" "$FINAL" || fail "предварительная прошивка не записалась"
+      PRE=1
+      say "Записано, модем перезагружается"
+      wait_reenum 60
+      return
+    fi
     if [ -n "$VIA" ] && [ $STEP -eq 0 ]; then
       say "Переходная прошивка: $(basename "$VIA")"
       flash "$tty" "$VIA" -k || fail "переходная прошивка не записалась"
@@ -298,7 +292,7 @@ stage_ports() {  # 1442 / отладочный режим: модем отдал
   fi
   t=$(at_port) || fail "в режиме $(mode) не найден AT-порт"
   check_hw "$("$AT" "$t" "AT^VERSION?" 3 2>/dev/null | sed -n 's/.*EXTH:\([^ ]*\).*/\1/p' | head -1)" "AT^VERSION?"
-  if [ $STEP -eq 0 ] && [ $NOADB -eq 1 ]; then
+  if [ $STEP -eq 0 ] && [ $PRE -eq 0 ] && [ $BALON -eq 0 ]; then
     say "AT^GODLOAD: перевожу в режим обновления"
     "$AT" "$t" "AT^GODLOAD" >>"$LOG" 2>&1
   else
@@ -309,37 +303,38 @@ stage_ports() {  # 1442 / отладочный режим: модем отдал
   wait_reenum 60 || fail "модем не перезагрузился"
 }
 stage_1f01() {
-  if [ $STEP -eq 0 ] && [ $NOADB -eq 1 ]; then
+  # до зачистки идём через AT-порт: он работает и тогда, когда сеть старой прошивки мертва
+  if [ $STEP -eq 0 ] && [ $PRE -eq 0 ] && [ $BALON -eq 0 ] && [ $DBG_FAIL -eq 0 ]; then
     say "Перевожу в отладочный режим (AT-порты)"
     usb_modeswitch -v 12d1 -p 1f01 -M $MSG_DEBUG >>"$LOG" 2>&1
-  else
-    say "Перевожу в HiLink"
-    usb_modeswitch -v 12d1 -p 1f01 -M $MSG_HILINK >>"$LOG" 2>&1
+    wait_reenum 30 || { DBG_FAIL=1; say "${Y}в отладочный режим не переключился, пробую HiLink${N}"; }
+    return
   fi
+  say "Перевожу в HiLink"
+  usb_modeswitch -v 12d1 -p 1f01 -M $MSG_HILINK >>"$LOG" 2>&1
   wait_reenum 30 || fail "модем не переключился из режима накопителя"
 }
 stage_14dc() {
-  local rc i
-  hilink_up; rc=$?
+  local rc i t=20
+  # всерьёз ждём сеть только от свежей прошивки; на сеть старой не полагаемся
+  { [ $STEP -eq 2 ] || [ $PRE -eq 1 ]; } && t=120
+  hilink_up $t; rc=$?
   if [ $rc -ne 0 ]; then
     [ $STEP -eq 2 ] && fail "после прошивки HiLink не работает: $(hl_err $rc)"
-    NOADB=1
-    say "${Y}HiLink не работает ($(hl_err $rc)) - прошивка встала криво${N}"
-    say "${Y}Выньте модем и вставьте снова (с замкнутой бутовой точкой - будет полная зачистка)${N}"
+    [ $PRE -eq 1 ] && fail "после предварительной прошивки HiLink не работает ($(hl_err $rc)) - без ADB в аварийку не попасть: вставьте модем с замкнутой бутовой точкой и запустите с --force-1443"
+    say "${Y}Сеть старой прошивки не отвечает ($(hl_err $rc)). Выньте модем и вставьте снова - дальше скрипт пойдёт через AT-порт${N}"
     for i in $(seq 600); do [ "$(mode)" != 14dc ] && return; sleep 1; done
     fail "модем не переподключили за 10 минут"
   fi
   [ $STEP -eq 2 ] && finish
   check_hw "$(xml HardwareVersion "$(api device/information)")" "веб-API"
-  if [ $NOADB -eq 0 ] && adb_ok; then
-    nv_backup
+  if adb_ok; then
     adb_wipe
     wait_mode 1443 90 || fail "после затирания загрузчика модем не вошёл в аварийку - нужна игла"
     return
   fi
-  NOADB=1
-  say "${Y}ADB нет: прошиваю через режим обновления, без балона и GO${N}"
-  say "Перезагружаю модем через веб-API"
+  [ $PRE -eq 1 ] && fail "в итоговой прошивке нет ADB - без иглы в аварийку не попасть (вставьте модем с иглой и запустите с --force-1443)"
+  say "ADB нет - перезагружаю модем через веб-API, дальше через AT-порт"
   api device/control '<?xml version="1.0" encoding="UTF-8"?><request><Control>1</Control></request>' >>"$LOG" 2>&1
   wait_reenum 90 || fail "модем не перезагрузился по API - выньте и вставьте его"
 }
@@ -381,7 +376,7 @@ mkdir -p /run/udev/rules.d
 : > "$UDEV_OVERRIDE"
 udevadm control --reload
 
-BALON=0; GO_DONE=0; STEP=0; NOADB=0; N1443=0; NDLOAD=0; MODEL_OK=0; LAST=""
+BALON=0; GO_DONE=0; STEP=0; PRE=0; DBG_FAIL=0; N1443=0; NDLOAD=0; MODEL_OK=0; LAST=""
 [ "$(mode)" = none ] && say "Вставьте модем в USB-порт сервера..."
 while :; do
   [ "$(date +%s)" -gt $DEADLINE ] && fail "не уложились в 40 минут"
