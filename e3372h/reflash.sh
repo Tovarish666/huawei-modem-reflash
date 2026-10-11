@@ -139,17 +139,20 @@ hilink_up() {  # hilink_up <сек на линк>; 0 - веб отвечает, 
   say "  жду сетевой линк от модема (до $1 с)..."
   for i in $(seq "$1"); do [ "$(cat "/sys/class/net/$ifc/carrier" 2>/dev/null)" = 1 ] && break; sleep 1; done
   [ "$(cat "/sys/class/net/$ifc/carrier" 2>/dev/null)" = 1 ] || return 2
-  # адрес веб-интерфейса бывает не 192.168.8.1 - узнаём через DHCP, маршрут по умолчанию не трогаем
-  local p
-  for i in $(seq 6); do p=$("$DHCP" "$ifc" 2>/dev/null) && break; sleep 5; done
-  if [ -n "$p" ]; then
-    set -- $p
-    MODEM_IP=$1; HOST_IP=$2
-  fi
   ip addr flush dev "$ifc"
   ip addr add "$HOST_IP/24" dev "$ifc"
-  say "  линк есть, модем $MODEM_IP, жду веб-интерфейс (до 60 с)..."
-  for i in $(seq 60); do curl -s -m 2 -o /dev/null http://$MODEM_IP/api/webserver/SesTokInfo && return 0; sleep 1; done
+  say "  линк есть, проверяю веб-интерфейс на $MODEM_IP (до 30 с)..."
+  for i in $(seq 30); do curl -s -m 2 -o /dev/null http://$MODEM_IP/api/webserver/SesTokInfo && return 0; sleep 1; done
+  # адрес веб-интерфейса бывает не 192.168.8.1 - узнаём через DHCP, маршрут по умолчанию не трогаем
+  say "  на $MODEM_IP не отвечает, узнаю адрес модема по DHCP..."
+  local p
+  p=$("$DHCP" "$ifc" 2>/dev/null) || return 3
+  set -- $p
+  MODEM_IP=$1; HOST_IP=$2
+  ip addr flush dev "$ifc"
+  ip addr add "$HOST_IP/24" dev "$ifc"
+  say "  модем на $MODEM_IP, жду веб-интерфейс (до 30 с)..."
+  for i in $(seq 30); do curl -s -m 2 -o /dev/null http://$MODEM_IP/api/webserver/SesTokInfo && return 0; sleep 1; done
   return 3
 }
 hl_err() { case $1 in 1) echo "нет сетевого интерфейса" ;; 2) echo "нет сетевого линка" ;; *) echo "веб-интерфейс не отвечает" ;; esac; }
@@ -346,6 +349,7 @@ finish() {
   say "  ПО $sw, WebUI $web"
   [ "$sw" = "$FWVER" ] || fail "на модеме ПО '$sw', а записывалось $FWVER"
   [ -n "$imei" ] || fail "IMEI пустой - NV не восстановились"
+  echo "$imei" | grep -qE '^0+$' && fail "IMEI нулевой - данные NV не восстановились (вероятно, повреждены износом памяти)"
   [ -n "$WEBVER" ] && [ "$web" != "$WEBVER" ] && say "${Y}  WebUI $web не совпадает с ожидаемой $WEBVER${N}"
   say "${G}ГОТОВО${N} - модем прошит, веб-интерфейс http://$MODEM_IP"
   exit 0
